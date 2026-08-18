@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "imagineit.klm",
+  "name": "imagineit KLM",
+  "version": "1.0.2",
+  "author": "Imagine it",
+  "description": "Clean keyboard language manager with live layout indicator, shortcuts and macOS-style switch OSD",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "imagineit KLM",
+    "description": "Keyboard languages, layout switcher and OSD",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

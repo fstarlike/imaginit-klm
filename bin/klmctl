@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+APP_ID = "imagineit.klm"
+BEGIN = "-- >>> imagineit KLM (managed) >>>"
+END = "-- <<< imagineit KLM (managed) <<<"
+VALID_TOKEN = re.compile(r"^[A-Za-z0-9_+.-]*$")
+UNTYPED = re.compile(r"^(hl-virtual-keyboard|power-button|sleep-button|lid-switch|video-bus)")
+GROUP_OPT = re.compile(r"^grp:")
+LEGACY_ALT_SHIFT_OPTION = "grp:alt_shift_toggle"
+SHORTCUT_OPTIONS = {
+    "none": "",
+    # Alt+Shift is implemented as native Hyprland modifier-only binds instead
+    # of XKB grp:alt_shift_toggle. The XKB action can be press-order-sensitive
+    # on real keyboards, while KLM registers both terminal modifier keys.
+    "alt-shift": "",
+    "ctrl-shift": "grp:ctrl_shift_toggle",
+    "both-shifts": "grp:shifts_toggle",
+}
+ALT_SHIFT_BIND_KEYS = ("SHIFT_L", "SHIFT_R", "ALT_L", "ALT_R")
+ALT_SHIFT_BIND_DESCRIPTION = "imagineit KLM: switch keyboard language"
+
+
+def home() -> Path:
+    return Path(os.environ.get("HOME", str(Path.home())))
+
+
+def state_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", home() / ".config")) / "imagineit-klm"
+
+
+def state_file() -> Path:
+    return state_dir() / "config.json"
+
+
+def input_file() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", home() / ".config")) / "hypr" / "input.lua"
+
+
+def log_file() -> Path:
+    return Path(os.environ.get("XDG_STATE_HOME", home() / ".local" / "state")) / "imagineit-klm" / "klm.log"
+
+
+def log(message: str) -> None:
+    try:
+        path = log_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(message.rstrip() + "\n")
+    except Exception:
+        pass
+
+
+def run(cmd: list[str], timeout: float = 4.0) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
+
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def split_csv(value: str) -> list[str]:
+    return [x.strip() for x in str(value or "").split(",")]
+
+
+def valid_token(value: str, allow_empty: bool = True) -> bool:
+    if not allow_empty and not value:
+        return False
+    return bool(VALID_TOKEN.fullmatch(value))
+
+
+def get_option(name: str) -> str:
+    # Hyprland's Lua config uses dotted option paths (input.kb_options). Older
+    # releases used colons, so probe both to keep the plugin upgrade-safe.
+    canonical = str(name or "").replace(":", ".")
+    candidates = [canonical]
+    legacy = canonical.replace(".", ":")
+    if legacy != canonical:
+        candidates.append(legacy)
+
+    for candidate in candidates:
+        proc = run(["hyprctl", "-j", "getoption", candidate])
+        if proc.returncode != 0:
+            continue
+        try:
+            obj = json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError:
+            continue
+        for key in ("str", "value", "data"):
+            value = obj.get(key)
+            if isinstance(value, str):
+                return value
+    return ""
+
+
+def typed_keyboards() -> list[dict[str, Any]]:
+    proc = run(["hyprctl", "-j", "devices"])
+    if proc.returncode != 0:
+        return []
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return []
+    keyboards = data.get("keyboards")
+    if not isinstance(keyboards, list):
+        return []
+    result = []
+    for kb in keyboards:
+        if not isinstance(kb, dict):
+            continue
+        name = str(kb.get("name") or "")
+        if not name or UNTYPED.search(name):
+            continue
+        result.append(kb)
+    return result
+
+
+def select_keyboard(keyboards: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not keyboards:
+        return None
+    mains = [k for k in keyboards if k.get("main") is True]
+    if mains:
+        return mains[0]
+    return max(keyboards, key=lambda k: int(k.get("active_layout_index") or 0))
+
+
+def parse_xkbcli(text: str) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    block: dict[str, str] = {}
+
+    def flush() -> None:
+        nonlocal block
+        layout = block.get("layout", "")
+        variant = block.get("variant", "")
+        desc = block.get("description", "")
+        brief = block.get("brief", "")
+        if layout and variant == "" and desc:
+            items.append({"code": layout, "name": desc, "brief": brief})
+        block = {}
+
+    for raw in str(text or "").splitlines():
+        if re.match(r"^\s*-\s+", raw):
+            flush()
+            raw = re.sub(r"^\s*-\s+", "  ", raw, count=1)
+        m = re.match(r"^\s*(layout|variant|brief|description):\s*(.*)$", raw)
+        if not m:
+            continue
+        value = m.group(2).strip().strip("'\"")
+        block[m.group(1)] = value
+    flush()
+
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+    for item in items:
+        if item["code"] in seen:
+            continue
+        seen.add(item["code"])
+        out.append(item)
+    return out
+
+
+def parse_base_lst(text: str) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    in_layout = False
+    for raw in text.splitlines():
+        if raw.startswith("!"):
+            in_layout = raw.strip().lower() == "! layout"
+            continue
+        if not in_layout or not raw.strip():
+            continue
+        m = re.match(r"^\s*(\S+)\s+(.+?)\s*$", raw)
+        if m:
+            out.append({"code": m.group(1), "name": m.group(2), "brief": ""})
+    return out
+
+
+def available_layouts() -> list[dict[str, str]]:
+    proc = run(["xkbcli", "list", "--load-exotic"], timeout=8.0)
+    items = parse_xkbcli(proc.stdout) if proc.returncode == 0 else []
+    if not items:
+        for candidate in (
+            Path("/usr/share/X11/xkb/rules/base.lst"),
+            Path("/usr/share/X11/xkb/rules/evdev.lst"),
+        ):
+            if candidate.exists():
+                try:
+                    items = parse_base_lst(candidate.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    items = []
+                if items:
+                    break
+    items.sort(key=lambda x: (x.get("name", "").casefold(), x.get("code", "")))
+    return items
+
+
+def detect_initial_state() -> dict[str, Any]:
+    keyboards = typed_keyboards()
+    kb = select_keyboard(keyboards)
+    layout_csv = str((kb or {}).get("layout") or "") or get_option("input.kb_layout") or "us"
+    layouts = [x for x in split_csv(layout_csv) if valid_token(x, False)] or ["us"]
+
+    variant_csv = str((kb or {}).get("variant") or "") or get_option("input.kb_variant")
+    variants = split_csv(variant_csv) if variant_csv else []
+    variants = [v if valid_token(v, True) else "" for v in variants]
+    while len(variants) < len(layouts):
+        variants.append("")
+    variants = variants[: len(layouts)]
+
+    options_csv = get_option("input.kb_options")
+    options = [o for o in split_csv(options_csv) if o and not GROUP_OPT.match(o)]
+    current_group = next((o for o in split_csv(options_csv) if GROUP_OPT.match(o)), "")
+    if current_group == LEGACY_ALT_SHIFT_OPTION:
+        # Migrate older KLM/XKB Alt+Shift configs to the order-neutral backend.
+        shortcut = "alt-shift"
+    else:
+        shortcut = next((k for k, v in SHORTCUT_OPTIONS.items() if v and v == current_group), "none")
+
+    return {
+        "version": 1,
+        "layouts": [{"code": code, "variant": variants[i]} for i, code in enumerate(layouts)],
+        "shortcut": shortcut,
+        "preservedOptions": options,
+        "osd": True,
+        "osdDuration": 950,
+        "showFullName": True,
+    }
+
+
+def sanitize_state(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        data = {}
+    layouts_in = data.get("layouts")
+    layouts: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    if isinstance(layouts_in, list):
+        for item in layouts_in:
+            if isinstance(item, str):
+                code, variant = item, ""
+            elif isinstance(item, dict):
+                code = str(item.get("code") or "").strip()
+                variant = str(item.get("variant") or "").strip()
+            else:
+                continue
+            if not valid_token(code, False) or not valid_token(variant, True):
+                continue
+            key = (code, variant)
+            if key in seen:
+                continue
+            seen.add(key)
+            layouts.append({"code": code, "variant": variant})
+    if not layouts:
+        layouts = [{"code": "us", "variant": ""}]
+
+    shortcut = str(data.get("shortcut") or "none")
+    if shortcut not in SHORTCUT_OPTIONS:
+        shortcut = "none"
+
+    preserved = []
+    for option in data.get("preservedOptions", []) if isinstance(data.get("preservedOptions"), list) else []:
+        option = str(option).strip()
+        if option and "," not in option and not GROUP_OPT.match(option):
+            preserved.append(option)
+
+    try:
+        duration = int(data.get("osdDuration", 950))
+    except (TypeError, ValueError):
+        duration = 950
+    duration = max(350, min(3000, duration))
+
+    return {
+        "version": 1,
+        "layouts": layouts,
+        "shortcut": shortcut,
+        "preservedOptions": preserved,
+        "osd": bool(data.get("osd", True)),
+        "osdDuration": duration,
+        "showFullName": bool(data.get("showFullName", True)),
+    }
+
+
+def load_state() -> dict[str, Any]:
+    path = state_file()
+    if path.exists():
+        try:
+            return sanitize_state(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            pass
+    state = sanitize_state(detect_initial_state())
+    save_state(state)
+    return state
+
+
+def save_state(state: dict[str, Any]) -> None:
+    state = sanitize_state(state)
+    state_dir().mkdir(parents=True, exist_ok=True)
+    atomic_write(state_file(), json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+
+
+def lua_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def render_alt_shift_binds() -> str:
+    lines = [
+        "-- Alt+Shift is handled by Hyprland rather than XKB so the combo is",
+        "-- order-neutral: Alt->Shift and Shift->Alt both switch once.",
+        'local __imagineit_klm_ctl = (os.getenv("HOME") or "") .. "/.config/omarchy/plugins/imagineit.klm/bin/klmctl"',
+    ]
+    flags = (
+        "{ release = true, locked = true, non_consuming = true, description = "
+        + lua_quote(ALT_SHIFT_BIND_DESCRIPTION) + " }"
+    )
+    for key in ALT_SHIFT_BIND_KEYS:
+        chord = f"ALT + SHIFT + {key}"
+        lines.append(
+            f"hl.bind({lua_quote(chord)}, "
+            f"hl.dsp.exec_cmd(__imagineit_klm_ctl .. \" switch next\"), {flags})"
+        )
+    return "\n".join(lines)
+
+
+def render_block(state: dict[str, Any]) -> str:
+    state = sanitize_state(state)
+    layouts = ",".join(x["code"] for x in state["layouts"])
+    variants = ",".join(x["variant"] for x in state["layouts"])
+    options = list(state["preservedOptions"])
+    group = SHORTCUT_OPTIONS[state["shortcut"]]
+    if group:
+        options.append(group)
+    options_csv = ",".join(options)
+    parts = [
+        BEGIN,
+        "-- This block is generated by imagineit KLM. Edit it from the KLM panel.",
+        "hl.config({",
+        "  input = {",
+        f"    kb_layout = {lua_quote(layouts)},",
+        f"    kb_variant = {lua_quote(variants)},",
+        f"    kb_options = {lua_quote(options_csv)},",
+        "  },",
+        "})",
+    ]
+    if state["shortcut"] == "alt-shift" and len(state["layouts"]) > 1:
+        parts.extend(["", render_alt_shift_binds()])
+    parts.append(END)
+    return "\n".join(parts)
+
+def runtime_values(state: dict[str, Any]) -> tuple[str, str, str]:
+    state = sanitize_state(state)
+    layouts = ",".join(x["code"] for x in state["layouts"])
+    variants = ",".join(x["variant"] for x in state["layouts"])
+    options = list(state["preservedOptions"])
+    group = SHORTCUT_OPTIONS[state["shortcut"]]
+    if group:
+        options.append(group)
+    return layouts, variants, ",".join(options)
+
+
+def live_config_expr(state: dict[str, Any], *, options_override: str | None = None) -> str:
+    layouts, variants, options = runtime_values(state)
+    if options_override is not None:
+        options = options_override
+    return (
+        "hl.config({ input = { "
+        f"kb_layout = {lua_quote(layouts)}, "
+        f"kb_variant = {lua_quote(variants)}, "
+        f"kb_options = {lua_quote(options)} "
+        "} })"
+    )
+
+
+def runtime_status(state: dict[str, Any] | None = None) -> dict[str, Any]:
+    state = sanitize_state(state or load_state())
+    layouts, variants, options = runtime_values(state)
+    actual_layouts = get_option("input.kb_layout")
+    actual_variants = get_option("input.kb_variant")
+    actual_options = get_option("input.kb_options")
+    expected_group = SHORTCUT_OPTIONS[state["shortcut"]]
+    actual_option_list = [x for x in split_csv(actual_options) if x]
+    if state["shortcut"] == "alt-shift":
+        shortcut_backend = "hyprland-order-neutral-bind"
+        # The bind is persisted in the managed Lua block and loaded by reload.
+        # Avoid parsing hyprctl binds -j because some 0.56 builds emitted
+        # malformed JSON there. A successful reload is the source of truth.
+        shortcut_active = len(state["layouts"]) > 1
+    else:
+        shortcut_backend = "xkb-option" if expected_group else "none"
+        shortcut_active = (not expected_group) or expected_group in actual_option_list
+    return {
+        "kbLayout": actual_layouts,
+        "kbVariant": actual_variants,
+        "kbOptions": actual_options,
+        "expectedKbLayout": layouts,
+        "expectedKbVariant": variants,
+        "expectedKbOptions": options,
+        "expectedShortcutOption": expected_group,
+        "shortcutBackend": shortcut_backend,
+        "shortcutActive": shortcut_active,
+        "layoutMatches": actual_layouts == layouts if actual_layouts else False,
+    }
+
+def live_apply_state(state: dict[str, Any], reset_options: bool = True) -> tuple[bool, str]:
+    """Apply XKB values immediately through Quattro's Lua runtime.
+
+    The Alt+Shift shortcut itself is a native Hyprland bind loaded from the
+    persisted managed block by apply_state(). Clearing kb_options here rebuilds
+    the XKB state and also removes the legacy order-sensitive XKB Alt+Shift
+    action during upgrades from v1.0.0/v1.0.1.
+    """
+    state = sanitize_state(state)
+    if not shutil.which("hyprctl"):
+        return False, "hyprctl not found"
+
+    if reset_options:
+        reset = run(["hyprctl", "eval", live_config_expr(state, options_override="")], timeout=6.0)
+        if reset.returncode != 0:
+            msg = (reset.stderr or reset.stdout or "failed to reset kb_options").strip()
+            log(f"live reset failed: {msg}")
+
+    proc = run(["hyprctl", "eval", live_config_expr(state)], timeout=6.0)
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "hyprctl eval failed").strip()
+        log(f"live apply failed: {msg}")
+        return False, msg
+
+    status = runtime_status(state)
+    if status["expectedShortcutOption"] and not status["shortcutActive"]:
+        msg = (
+            "Hyprland did not activate " + status["expectedShortcutOption"]
+            + "; runtime kb_options=" + (status["kbOptions"] or "<empty>")
+        )
+        log(msg)
+        return False, msg
+    if status["kbLayout"] and not status["layoutMatches"]:
+        msg = (
+            "Hyprland layout mismatch: expected " + status["expectedKbLayout"]
+            + ", runtime " + status["kbLayout"]
+        )
+        log(msg)
+        return False, msg
+    return True, "ok"
+
+def upsert_block(original: str, block: str) -> str:
+    pattern = re.compile(re.escape(BEGIN) + r".*?" + re.escape(END), re.S)
+    original = original.rstrip()
+    if pattern.search(original):
+        return pattern.sub(block, original, count=1).rstrip() + "\n"
+    prefix = original + ("\n\n" if original else "")
+    return prefix + block + "\n"
+
+
+def remove_block_text(original: str) -> str:
+    pattern = re.compile(r"\n?" + re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n?", re.S)
+    return pattern.sub("\n", original, count=1).rstrip() + ("\n" if original else "")
+
+
+def apply_state(state: dict[str, Any], reload_hypr: bool = True) -> tuple[bool, str]:
+    state = sanitize_state(state)
+    save_state(state)
+    path = input_file()
+    try:
+        original = path.read_text(encoding="utf-8") if path.exists() else ""
+        backup = path.with_name(path.name + ".imagineit-klm.bak")
+        if path.exists() and not backup.exists():
+            shutil.copy2(path, backup)
+        atomic_write(path, upsert_block(original, render_block(state)))
+    except OSError as exc:
+        log(f"write failed: {exc}")
+        return False, str(exc)
+
+    if reload_hypr and shutil.which("hyprctl"):
+        # The managed block now contains native modifier-only binds. Reload first
+        # so enabling/disabling them is deterministic and no duplicate runtime
+        # registrations accumulate. Then refresh XKB values live.
+        reload_proc = run(["hyprctl", "reload"], timeout=6.0)
+        if reload_proc.returncode != 0:
+            reload_msg = (reload_proc.stderr or reload_proc.stdout or "hyprctl reload failed").strip()
+            log(reload_msg)
+            return False, reload_msg
+
+        ok, msg = live_apply_state(state, reset_options=True)
+        if not ok:
+            return False, msg
+    return True, "ok"
+
+def clean_config(reload_hypr: bool = True) -> tuple[bool, str]:
+    path = input_file()
+    if not path.exists():
+        return True, "ok"
+    try:
+        original = path.read_text(encoding="utf-8")
+        atomic_write(path, remove_block_text(original))
+    except OSError as exc:
+        return False, str(exc)
+    if reload_hypr and shutil.which("hyprctl"):
+        run(["hyprctl", "reload"], timeout=6.0)
+    return True, "ok"
+
+
+def active_info() -> dict[str, Any]:
+    keyboards = typed_keyboards()
+    kb = select_keyboard(keyboards)
+    if not kb:
+        return {"keyboard": "", "activeName": "", "activeIndex": 0, "keyboardCount": 0}
+    return {
+        "keyboard": str(kb.get("name") or ""),
+        "activeName": str(kb.get("active_keymap") or ""),
+        "activeIndex": int(kb.get("active_layout_index") or 0),
+        "keyboardCount": len(keyboards),
+    }
+
+
+def snapshot() -> dict[str, Any]:
+    state = load_state()
+    return {
+        "state": state,
+        "active": active_info(),
+        "available": available_layouts(),
+        "runtime": runtime_status(state),
+        "paths": {"state": str(state_file()), "input": str(input_file())},
+    }
+
+
+def mutate_and_apply(mutator) -> tuple[bool, str]:
+    state = load_state()
+    mutator(state)
+    return apply_state(state)
+
+
+def cmd_add_layout(code: str, variant: str = "") -> tuple[bool, str]:
+    code, variant = code.strip(), variant.strip()
+    if not valid_token(code, False) or not valid_token(variant, True):
+        return False, "invalid layout or variant"
+    available_codes = {x["code"] for x in available_layouts()}
+    if available_codes and code not in available_codes:
+        return False, f"layout not installed: {code}"
+
+    def mutate(state: dict[str, Any]) -> None:
+        if not any(x["code"] == code and x["variant"] == variant for x in state["layouts"]):
+            state["layouts"].append({"code": code, "variant": variant})
+        if len(state["layouts"]) > 1 and state["shortcut"] == "none":
+            state["shortcut"] = "alt-shift"
+
+    return mutate_and_apply(mutate)
+
+
+def cmd_remove_layout(code: str) -> tuple[bool, str]:
+    code = code.strip()
+    if not valid_token(code, False):
+        return False, "invalid layout"
+
+    state = load_state()
+    filtered = [x for x in state["layouts"] if x["code"] != code]
+    if not filtered:
+        return False, "at least one keyboard layout must remain"
+    state["layouts"] = filtered
+    if len(filtered) < 2:
+        state["shortcut"] = "none"
+    return apply_state(state)
+
+
+def cmd_set_shortcut(name: str) -> tuple[bool, str]:
+    if name not in SHORTCUT_OPTIONS:
+        return False, "unknown shortcut"
+    state = load_state()
+    if name != "none" and len(state["layouts"]) < 2:
+        return False, "add a second layout first"
+    state["shortcut"] = name
+    return apply_state(state)
+
+
+def cmd_set_osd(value: str) -> tuple[bool, str]:
+    state = load_state()
+    state["osd"] = value.lower() in ("1", "true", "yes", "on")
+    save_state(state)
+    return True, "ok"
+
+
+def cmd_set_duration(value: str) -> tuple[bool, str]:
+    try:
+        duration = int(value)
+    except ValueError:
+        return False, "duration must be an integer"
+    state = load_state()
+    state["osdDuration"] = max(350, min(3000, duration))
+    save_state(state)
+    return True, "ok"
+
+
+def cmd_switch(target: str) -> tuple[bool, str]:
+    if target not in ("next", "prev"):
+        try:
+            index = int(target)
+        except ValueError:
+            return False, "switch target must be next, prev, or an index"
+        if index < 0:
+            return False, "invalid index"
+        target = str(index)
+
+    keyboards = typed_keyboards()
+    if not keyboards:
+        return False, "no physical keyboard found"
+    errors = []
+    for kb in keyboards:
+        name = str(kb.get("name") or "")
+        proc = run(["hyprctl", "switchxkblayout", name, target])
+        if proc.returncode != 0:
+            errors.append((proc.stderr or proc.stdout or name).strip())
+    if errors:
+        return False, "; ".join(errors)
+    return True, "ok"
+
+
+def cmd_repair_shortcut() -> tuple[bool, str]:
+    state = load_state()
+    if len(state["layouts"]) < 2:
+        return False, "add a second layout first"
+    if state["shortcut"] == "none":
+        state["shortcut"] = "alt-shift"
+    # Re-render and reload so both Alt->Shift and Shift->Alt binds are present.
+    return apply_state(state)
+
+def cmd_diagnose() -> dict[str, Any]:
+    state = load_state()
+    keyboards = typed_keyboards()
+    return {
+        "app": APP_ID,
+        "python": sys.version.split()[0],
+        "hyprctl": shutil.which("hyprctl") or "",
+        "xkbcli": shutil.which("xkbcli") or "",
+        "inputFile": str(input_file()),
+        "inputFileExists": input_file().exists(),
+        "managedBlockPresent": BEGIN in (input_file().read_text(encoding="utf-8", errors="ignore") if input_file().exists() else ""),
+        "stateFile": str(state_file()),
+        "state": state,
+        "runtime": runtime_status(state),
+        "active": active_info(),
+        "keyboards": [
+            {
+                "name": str(k.get("name") or ""),
+                "layout": str(k.get("layout") or ""),
+                "variant": str(k.get("variant") or ""),
+                "activeKeymap": str(k.get("active_keymap") or ""),
+                "activeIndex": int(k.get("active_layout_index") or 0),
+                "main": bool(k.get("main") is True),
+            }
+            for k in keyboards
+        ],
+        "availableLayoutCount": len(available_layouts()),
+    }
+
+
+def output_result(ok: bool, message: str = "ok") -> int:
+    print(json.dumps({"ok": ok, "message": message}, ensure_ascii=False))
+    return 0 if ok else 1
+
+
+def usage() -> int:
+    print("""imagineit KLM controller
+
+Usage:
+  klmctl snapshot
+  klmctl available
+  klmctl add-layout CODE [VARIANT]
+  klmctl remove-layout CODE
+  klmctl set-shortcut none|alt-shift|ctrl-shift|both-shifts
+  klmctl set-osd on|off
+  klmctl set-duration MILLISECONDS
+  klmctl switch next|prev|INDEX
+  klmctl apply
+  klmctl repair-shortcut
+  klmctl clean
+  klmctl diagnose
+""")
+    return 2
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        return usage()
+    cmd = argv[1]
+    if cmd == "snapshot":
+        print(json.dumps(snapshot(), ensure_ascii=False))
+        return 0
+    if cmd == "available":
+        print(json.dumps(available_layouts(), ensure_ascii=False))
+        return 0
+    if cmd == "add-layout" and len(argv) >= 3:
+        return output_result(*cmd_add_layout(argv[2], argv[3] if len(argv) > 3 else ""))
+    if cmd == "remove-layout" and len(argv) >= 3:
+        return output_result(*cmd_remove_layout(argv[2]))
+    if cmd == "set-shortcut" and len(argv) >= 3:
+        return output_result(*cmd_set_shortcut(argv[2]))
+    if cmd == "set-osd" and len(argv) >= 3:
+        return output_result(*cmd_set_osd(argv[2]))
+    if cmd == "set-duration" and len(argv) >= 3:
+        return output_result(*cmd_set_duration(argv[2]))
+    if cmd == "switch" and len(argv) >= 3:
+        return output_result(*cmd_switch(argv[2]))
+    if cmd == "apply":
+        return output_result(*apply_state(load_state()))
+    if cmd == "repair-shortcut":
+        return output_result(*cmd_repair_shortcut())
+    if cmd == "clean":
+        return output_result(*clean_config())
+    if cmd == "diagnose":
+        print(json.dumps(cmd_diagnose(), ensure_ascii=False, indent=2))
+        return 0
+    return usage()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
