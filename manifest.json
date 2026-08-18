@@ -2,9 +2,10 @@
   "schemaVersion": 1,
   "id": "imagineit.klm",
   "name": "imagineit KLM",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "author": "Imagine it",
-  "description": "Clean keyboard language manager with live layout indicator, shortcuts and switch OSD",
+  "description": "Keyboard language manager with live layout indicator, Alt+Shift switching, searchable XKB layouts, and switch OSD.",
+  "license": "MIT",
   "kinds": [
     "bar-widget"
   ],

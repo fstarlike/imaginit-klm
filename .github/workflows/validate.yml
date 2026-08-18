@@ -1,0 +1,19 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate manifest JSON
+        run: python3 -m json.tool manifest.json >/dev/null
+      - name: Run KLM controller tests
+        run: python3 tests/test_klmctl.py

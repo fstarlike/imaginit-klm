@@ -1,85 +1,98 @@
 # imagineit KLM
 
-<img width="387" height="586" alt="image" src="https://github.com/user-attachments/assets/d6ba6ba7-f5b8-46a1-976d-4d13acf4fcdf" />
-
+<img width="387" height="586" alt="imagineit KLM panel" src="https://github.com/user-attachments/assets/d6ba6ba7-f5b8-46a1-976d-4d13acf4fcdf" />
 
 **Keyboard Language Manager for Omarchy 4 / Quattro.**
 
-imagineit KLM replaces the basic Omarchy keyboard-layout label with a small language manager designed to feel native to the new Quickshell bar.
+imagineit KLM replaces the basic keyboard-layout label with a compact language manager designed for the Omarchy Quickshell bar.
 
 ## Features
 
-- Current keyboard language as **text in the bar** (`English`, `Persian`, ...), not an icon.
-- Click the label to open a clean language manager.
-- Add/remove any layout provided by the system XKB database.
-- `Alt + Shift` switching, enabled from the UI, with **both press orders supported** (`Alt → Shift` and `Shift → Alt`).
-- Immediate Hyprland `activelayout` event tracking — no fast polling loop.
-- macOS-inspired centered OSD whenever the active language changes.
+- Current keyboard language as **text in the bar** (`English`, `Persian`, ...).
+- Click the label to open the language manager.
+- Add or remove layouts from the installed XKB database.
+- Optional **Alt + Shift** switching with both press orders supported (`Alt → Shift` and `Shift → Alt`).
+- Immediate Hyprland `activelayout` event tracking; no fast polling loop.
+- Centered OSD when the active language changes.
 - Right-click the bar label to switch to the next language.
 - Mouse wheel over the label switches previous/next.
 - Multi-keyboard awareness: explicit selections are synchronized across physical keyboards.
-- Persists through `~/.config/hypr/input.lua` using Omarchy 4's current Lua config syntax.
-- Preserves unrelated `kb_options` such as Compose settings.
-- Does not overwrite the rest of the user's `input.lua`.
+- Persists the managed keyboard configuration in Omarchy 4's `~/.config/hypr/input.lua`.
+- Preserves unrelated `kb_options`, such as Compose settings.
+- Updates only its own clearly marked block in `input.lua`; unrelated user configuration is left untouched.
 - Searchable XKB language/layout picker.
-- Automatic state persistence and safe atomic config writes.
+- Atomic writes and a one-time safety backup before the first managed `input.lua` change.
+- No background daemon.
 
-## Important terminology
+## Requirements
 
-On Linux/Omarchy there normally is no separate package to install for each keyboard language. Layouts are supplied by **xkeyboard-config**. In KLM, “Add language” means enable one of those installed XKB layouts for Hyprland.
+- Omarchy 4 / Quattro
+- Hyprland
+- Omarchy Shell / Quickshell
+- Python 3
+- XKB layout data from `xkeyboard-config`
+- `xkbcli` is preferred; KLM falls back to the installed XKB rules files when it is unavailable
 
-## Install from this folder
+## Install
 
-```bash
-chmod +x install.sh
-./install.sh
-```
-
-The plugin is installed to:
-
-```text
-~/.config/omarchy/plugins/imagineit.klm/
-```
-
-The installer disables Omarchy's built-in `omarchy.keyboard-layout` widget to prevent two language labels from appearing at once.
-
-If needed, enable manually:
+Use Omarchy's native plugin manager:
 
 ```bash
-omarchy-shell shell rescanPlugins
-omarchy plugin enable imagineit.klm
+omarchy plugin add https://github.com/fstarlike/imaginit-klm.git --enable
 ```
 
-## Persian + English
+The manifest requests the **right** section of the bar by default.
+
+Omarchy already ships its own `omarchy.keyboard-layout` widget. If you do not want two layout labels in the bar, disable the stock widget explicitly:
+
+```bash
+omarchy plugin disable omarchy.keyboard-layout
+```
+
+KLM does **not** disable or rewrite other Omarchy plugins automatically.
+
+## Persian + English quick start
 
 Open **imagineit KLM** from the bar:
 
-1. `Add language`
-2. Search for `Persian` or `ir`
-3. Add it
-4. Enable **Alt + Shift**
+1. Choose **Add language**.
+2. Search for `Persian` or `ir`.
+3. Add the layout.
+4. Enable **Alt + Shift**.
 
-KLM writes a managed block equivalent to:
+For Alt+Shift, KLM uses native Hyprland modifier-only release bindings instead of XKB `grp:alt_shift_toggle`. This avoids the press-order asymmetry seen on some keyboards, so both `Alt → Shift` and `Shift → Alt` can switch the layout.
 
-```lua
-hl.config({
-  input = {
-    kb_layout = "us,ir",
-    kb_variant = ",",
-    kb_options = "compose:caps", -- unrelated options are preserved
-  },
-})
+## What KLM changes
 
-local ctl = (os.getenv("HOME") or "") .. "/.config/omarchy/plugins/imagineit.klm/bin/klmctl"
-hl.bind("ALT + SHIFT + SHIFT_L", hl.dsp.exec_cmd(ctl .. " switch next"), { release = true, non_consuming = true })
-hl.bind("ALT + SHIFT + SHIFT_R", hl.dsp.exec_cmd(ctl .. " switch next"), { release = true, non_consuming = true })
-hl.bind("ALT + SHIFT + ALT_L",   hl.dsp.exec_cmd(ctl .. " switch next"), { release = true, non_consuming = true })
-hl.bind("ALT + SHIFT + ALT_R",   hl.dsp.exec_cmd(ctl .. " switch next"), { release = true, non_consuming = true })
+KLM stores its own state in:
+
+```text
+~/.config/imagineit-klm/config.json
 ```
 
-The native Hyprland bindings intentionally replace XKB `grp:alt_shift_toggle` for this shortcut. That avoids the real-world press-order asymmetry where only one of `Alt → Shift` or `Shift → Alt` may switch.
+and logs diagnostic messages in:
 
-The exact block is merged into `~/.config/hypr/input.lua`; existing settings outside the marked block are not replaced.
+```text
+~/.local/state/imagineit-klm/klm.log
+```
+
+KLM does not modify `~/.config/hypr/input.lua` merely because the widget was loaded. The managed block is written after an explicit configuration change such as adding/removing a language or changing the shortcut.
+
+Before the first managed change, an existing input file is backed up once as:
+
+```text
+~/.config/hypr/input.lua.imagineit-klm.bak
+```
+
+The inserted block is delimited by:
+
+```text
+-- >>> imagineit KLM (managed) >>>
+...
+-- <<< imagineit KLM (managed) <<<
+```
+
+Everything outside that block is preserved.
 
 ## CLI
 
@@ -90,46 +103,46 @@ The exact block is merged into `~/.config/hypr/input.lua`; existing settings out
 ~/.config/omarchy/plugins/imagineit.klm/bin/klmctl add-layout ir
 ~/.config/omarchy/plugins/imagineit.klm/bin/klmctl set-shortcut alt-shift
 ~/.config/omarchy/plugins/imagineit.klm/bin/klmctl switch next
-```
-
-## Files created by KLM
-
-```text
-~/.config/imagineit-klm/config.json
-~/.local/state/imagineit-klm/klm.log
-~/.config/hypr/input.lua.imagineit-klm.bak   # one-time safety backup, if input.lua existed
-```
-
-KLM also inserts a clearly marked managed block into `~/.config/hypr/input.lua` after the first configuration change.
-
-## Uninstall
-
-Run:
-
-```bash
-./uninstall.sh
-```
-
-The uninstaller removes only the managed KLM block and re-enables Omarchy's stock keyboard-layout widget. It does not replace the rest of `input.lua` with the backup.
-
-## Requirements
-
-- Omarchy 4 / Quattro
-- Hyprland
-- Omarchy Shell / Quickshell
-- Python 3
-- XKB layout data (`xkeyboard-config`; `xkbcli` preferred)
-
-No background daemon is required.
-
-## v1.0.2 Alt+Shift order fix
-
-KLM no longer uses XKB `grp:alt_shift_toggle` for the Alt+Shift mode. It installs native Hyprland modifier-only release bindings for both possible terminal keys, so **Alt then Shift** and **Shift then Alt** behave the same. Existing v1.0.0/v1.0.1 state is migrated automatically on upgrade; the legacy XKB group option is cleared before the new bindings are loaded.
-
-The settings footer also includes a clickable **Imagine it · imagineit.online** link.
-
-Manual repair command:
-
-```bash
 ~/.config/omarchy/plugins/imagineit.klm/bin/klmctl repair-shortcut
 ```
+
+## Update
+
+```bash
+omarchy plugin update imagineit.klm
+```
+
+## Remove
+
+KLM writes a managed block into `input.lua` only after you change its keyboard settings, so clean that block before removing the plugin:
+
+```bash
+~/.config/omarchy/plugins/imagineit.klm/bin/klmctl clean
+omarchy plugin remove imagineit.klm
+```
+
+If you disabled Omarchy's stock keyboard-layout widget during setup, you can restore it afterward:
+
+```bash
+omarchy plugin enable omarchy.keyboard-layout
+```
+
+The plugin removal command removes the plugin checkout. KLM's own state/log files are intentionally left in place so an update or reinstall can retain preferences; they can be deleted manually if a full reset is desired.
+
+## Privacy and network access
+
+KLM performs no analytics and sends no keyboard, layout, or system information to a remote service.
+
+The panel contains a clickable **Imagine it · imagineit.online** link. Network access happens only when the user explicitly opens that link in the default browser.
+
+## Version 1.0.3
+
+- Prepared the repository for the current Omarchy Plugins submission rules.
+- Switched the documentation to Omarchy's native plugin add/update/remove flow.
+- Added explicit MIT license metadata to the plugin manifest.
+- Documented user-configuration boundaries and safe removal.
+- Added automated repository checks while keeping the runtime dependency-free.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
