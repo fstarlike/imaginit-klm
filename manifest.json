@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "imagineit.klm",
   "name": "imagineit KLM",
-  "version": "1.0.2",
+  "version": "1.0.0",
   "author": "Imagine it",
   "description": "Clean keyboard language manager with live layout indicator, shortcuts and macOS-style switch OSD",
   "kinds": [
