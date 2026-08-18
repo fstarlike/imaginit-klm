@@ -1,5 +1,8 @@
 # imagineit KLM
 
+<img width="387" height="586" alt="image" src="https://github.com/user-attachments/assets/d6ba6ba7-f5b8-46a1-976d-4d13acf4fcdf" />
+
+
 **Keyboard Language Manager for Omarchy 4 / Quattro.**
 
 imagineit KLM replaces the basic Omarchy keyboard-layout label with a small language manager designed to feel native to the new Quickshell bar.
