@@ -4,7 +4,7 @@
   "name": "imagineit KLM",
   "version": "1.0.0",
   "author": "Imagine it",
-  "description": "Clean keyboard language manager with live layout indicator, shortcuts and macOS-style switch OSD",
+  "description": "Clean keyboard language manager with live layout indicator, shortcuts and switch OSD",
   "kinds": [
     "bar-widget"
   ],
